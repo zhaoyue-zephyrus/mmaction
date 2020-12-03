@@ -9,6 +9,7 @@ from .utils import to_tensor
 
 try:
     import decord
+    import av
 except ImportError:
     pass
 
@@ -62,6 +63,7 @@ class VideoDataset(Dataset):
                  max_distort=1,
                  input_format='NCHW',
                  use_decord=False,
+                 decoder='opencv',
                  video_ext='mp4'):
         # prefix of images path
         self.img_prefix = img_prefix
@@ -153,6 +155,10 @@ class VideoDataset(Dataset):
         '''
 
         self.use_decord = use_decord
+        if self.use_decord:
+            decoder = 'decord'
+        assert decoder in ['opencv', 'decord', 'pyav']
+        self.decoder = decoder
         self.video_ext = video_ext
 
     def __len__(self):
@@ -255,31 +261,50 @@ class VideoDataset(Dataset):
 
     def _get_frames(self, record, video_reader, image_tmpl, modality, indices,
                     skip_offsets):
-        if self.use_decord:
-            if modality not in ['RGB', 'RGBDiff']:
-                raise NotImplementedError
-            images = list()
+        if self.decoder == 'decord':
+            ## straight
+            decord_type = 'jump'
+            assert decord_type in ['straight', 'jump']
+            if decord_type == 'straight':
+                if modality not in ['RGB', 'RGBDiff']:
+                    raise NotImplementedError
+                images = list()
+                for seg_ind in indices:
+                    p = int(seg_ind)
+                    if p > 1:
+                        video_reader.seek(p - 1)
+                    cur_content = video_reader.next().asnumpy()
+                    # Cache the (p-1)-th frame first. This is to avoid decord's
+                    # StopIteration, which may consequently affect the mmcv.runner
+                    for i, ind in enumerate(
+                            range(0, self.old_length, self.new_step)):
+                        if (skip_offsets[i] > 0
+                                and p + skip_offsets[i] <= record.num_frames):
+                            if skip_offsets[i] > 1:
+                                video_reader.skip_frames(skip_offsets[i] - 1)
+                            cur_content = video_reader.next().asnumpy()
+                        seg_imgs = [cur_content]
+                        images.extend(seg_imgs)
+                        if (self.new_step > 1
+                                and p + self.new_step <= record.num_frames):
+                            video_reader.skip_frames(self.new_step - 1)
+                        p += self.new_step
+                return images
+            else:
+                dense_indices_list = []
+                for seg_ind in indices:
+                    new_indices = seg_ind * np.ones(self.new_length) + np.arange(0, self.old_length, self.new_step) + skip_offsets
+                    new_indices[new_indices >= record.num_frames] = record.num_frames - 1
+                    dense_indices_list += list(new_indices.astype(int))
+                out = video_reader.get_batch(dense_indices_list).asnumpy()
+                return [out[i, ...] for i in range(out.shape[0])]
+        elif self.decoder == 'pyav':
+            dense_indices_list = []
             for seg_ind in indices:
-                p = int(seg_ind)
-                if p > 1:
-                    video_reader.seek(p - 1)
-                cur_content = video_reader.next().asnumpy()
-                # Cache the (p-1)-th frame first. This is to avoid decord's
-                # StopIteration, which may consequently affect the mmcv.runner
-                for i, ind in enumerate(
-                        range(0, self.old_length, self.new_step)):
-                    if (skip_offsets[i] > 0
-                            and p + skip_offsets[i] <= record.num_frames):
-                        if skip_offsets[i] > 1:
-                            video_reader.skip_frames(skip_offsets[i] - 1)
-                        cur_content = video_reader.next().asnumpy()
-                    seg_imgs = [cur_content]
-                    images.extend(seg_imgs)
-                    if (self.new_step > 1
-                            and p + self.new_step <= record.num_frames):
-                        video_reader.skip_frames(self.new_step - 1)
-                    p += self.new_step
-            return images
+                new_indices = seg_ind * np.ones(self.new_length)  + np.arange(0, self.old_length, self.new_step) + skip_offsets
+                new_indices[new_indices >= record.num_frames] = record.num_frames - 1
+                dense_indices_list += list(new_indices.astype(int))
+            return [video_reader[i].to_ndarray(format='rgb24') for i in dense_indices_list]
         else:
             images = list()
             for seg_ind in indices:
@@ -302,9 +327,16 @@ class VideoDataset(Dataset):
 
     def __getitem__(self, idx):
         record = self.video_infos[idx]
-        if self.use_decord:
+        if self.decoder == 'decord':
             video_reader = decord.VideoReader('{}.{}'.format(
                 osp.join(self.img_prefix, record.path), self.video_ext))
+            record.num_frames = len(video_reader)
+        elif self.decoder == 'pyav':
+            video_container = av.open('{}.{}'.format(
+                osp.join(self.img_prefix, record.path), self.video_ext))
+            video_container.streams.video[0].thread_type = 'AUTO'
+            video_reader = [frame for frame in video_container.decode(video=0)]
+            video_container.close()
             record.num_frames = len(video_reader)
         else:
             video_reader = mmcv.VideoReader('{}.{}'.format(
