@@ -131,7 +131,8 @@ def main():
 
     # for regular testing
     if cfg.data.test.oversample == 'three_crop':
-        cfg.model.spatial_temporal_module.spatial_size = 8
+        cfg.model.spatial_temporal_module.temporal_size = -1
+        cfg.model.spatial_temporal_module.spatial_size = -1
 
     dataset = obj_from_dict(cfg.data.test, datasets, dict(test_mode=True))
 
